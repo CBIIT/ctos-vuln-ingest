@@ -1,0 +1,5 @@
+prefect>=2.14
+boto3
+psycopg2-binary
+python-dotenv
+requests

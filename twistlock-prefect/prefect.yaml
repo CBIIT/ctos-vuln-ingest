@@ -1,0 +1,25 @@
+name: twistlock-vuln-reporter
+prefect-version: 3.2.14
+
+build: null
+push: null
+
+pull:
+  - prefect.deployments.steps.git_clone:
+      id: clone-step
+      repository: https://github.com/CBIIT/ctos-vuln-ingest.git
+      branch: main
+  - prefect.deployments.steps.pip_install_requirements:
+      requirements_file: twistlock-prefect/requirements.txt
+      directory: "{{ clone-step.directory }}"
+      stream_output: false
+
+deployments:
+  - name: twistlock-weekly-pull
+    entrypoint: twistlock-prefect/flows/twistlock_vuln_pull.py:twistlock_vuln_pull
+    schedule:
+      cron: "0 10 * * 1"   # Monday 10:00 UTC = 06:00 ET
+      timezone: America/New_York
+    work_pool:
+      name: ccdi-dcc-8gb-prefect-3.4.19-python3.13
+     
