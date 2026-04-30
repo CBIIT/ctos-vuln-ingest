@@ -4,8 +4,8 @@
 
 # Twistlock / Prisma Cloud Compute
 TWISTLOCK_BASE_URL=https://twistlock.nci.nih.gov
-TWISTLOCK_USERNAME=ctos-cicd-user
-TWISTLOCK_PASSWORD=0N9jQrxwoK0Kg4Ltybgi
+TWISTLOCK_USERNAME=
+TWISTLOCK_PASSWORD=
 
 # PostgreSQL connection — defaults match docker-compose.yml
 DB_HOST=vis-dev.c97np8fl1swd.us-east-1.rds.amazonaws.com
