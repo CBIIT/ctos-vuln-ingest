@@ -8,9 +8,9 @@ TWISTLOCK_USERNAME=
 TWISTLOCK_PASSWORD=
 
 # PostgreSQL connection — defaults match docker-compose.yml
-DB_HOST=vis-dev.c97np8fl1swd.us-east-1.rds.amazonaws.com
+DB_HOST=
 DB_PORT=5432
 DB_NAME=vuln_ingest
 DB_USER=postgres
-DB_PASSWORD=kH1cgPf24jLXoM7EkaOP
+DB_PASSWORD=
 PREFECT_API_URL=
