@@ -300,8 +300,8 @@ def insert_scan(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO scans (component_id, week, scanned_at, vuln_count)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO scans (component_id, week, scanned_at, vuln_count, scanned_tag)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -309,6 +309,7 @@ def insert_scan(
                         scan_week,
                         datetime.now(timezone.utc),
                         len(vulns),
+                        component["current_tag"],
                     ),
                 )
                 scan_id = cur.fetchone()[0]

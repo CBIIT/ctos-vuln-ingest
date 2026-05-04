@@ -15,11 +15,14 @@ CREATE TABLE IF NOT EXISTS scans (
     component_id INTEGER     NOT NULL REFERENCES components(id) ON DELETE CASCADE,
     week         TEXT        NOT NULL,  -- ISO week, e.g. '2025-W04'
     scanned_at   TIMESTAMPTZ NOT NULL,
-    vuln_count   INTEGER     NOT NULL
+    vuln_count   INTEGER     NOT NULL,
+    scanned_tag  TEXT
 );
 
 -- Drop unique constraint if it exists from a prior migration (allow multiple runs per week)
 ALTER TABLE scans DROP CONSTRAINT IF EXISTS scans_component_id_week_key;
+-- Add scanned_tag to existing DBs (idempotent)
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS scanned_tag TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_scans_component_week
     ON scans (component_id, week);
