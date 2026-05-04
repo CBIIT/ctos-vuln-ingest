@@ -147,9 +147,14 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
-# Environments
+# Environments — never commit secrets
 .env
+.env.*
 .envrc
+.env copy*
+env copy*
+*\ copy\ [0-9]*
+*\ copy
 .venv
 env/
 venv/

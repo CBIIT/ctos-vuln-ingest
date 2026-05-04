@@ -1,13 +1,13 @@
 # twistlock-vuln-reporter
 
-Prefect flow that pulls vulnerability scan data from Twistlock (Prisma Cloud Compute) weekly and upserts it into PostgreSQL.
+Prefect flow that pulls vulnerability scan data from Twistlock (Prisma Cloud Compute) weekly and inserts it into PostgreSQL.
 
 ## How it works
 
 1. **Authenticate** — obtains a bearer token from the Twistlock API.
 2. **Fetch components** — reads the `components` table in PostgreSQL to get the list of images to scan (`project`, `image_name`, `current_tag`).
-3. **Pull scan data** — calls `GET /api/v1/images` for each component and extracts the vulnerabilities array.
-4. **Upsert** — writes one row to `scans` (keyed on `component_id` + ISO week) and replaces the linked rows in `vulnerabilities`. Re-running the flow in the same week is safe and idempotent.
+3. **Pull scan data** — calls `GET /api/v1/registry` for each component and extracts the vulnerabilities array.
+4. **Insert** — writes a new row to `scans` (recording the component, ISO week, timestamp, and scanned tag) and inserts the linked rows in `vulnerabilities`. Every run is stored independently — multiple runs in the same week are all kept.
 
 Components with no Twistlock scan data are skipped with a warning; the flow continues and does not fail.
 
@@ -114,7 +114,7 @@ Deployment config:
 |---|---|
 | Name | `twistlock-weekly-pull` |
 | Schedule | Every Monday at 10:00 UTC (06:00 ET) |
-| Work pool | `ccdi-dcc-16gb-prefect-3.4.19-python3.13` |
+| Work pool | `ccdi-dcc-8gb-prefect-3.4.19-python3.13` |
 | Pull step | Git clone `ctos-vuln-ingest` + `pip install -r requirements.txt` |
 
 ## Project layout
@@ -136,4 +136,38 @@ twistlock-prefect/
 
 ## Database schema
 
-Three tables: `components` (what to scan), `scans` (one row per component per ISO week), and `vulnerabilities` (individual CVEs linked to a scan). Full DDL is in [twistlock-prefect/db/migrate.sql](twistlock-prefect/db/migrate.sql).
+Three tables. Full DDL is in [twistlock-prefect/db/migrate.sql](twistlock-prefect/db/migrate.sql).
+
+### `components`
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL | Primary key |
+| `project` | TEXT | Project name |
+| `image_name` | TEXT | Container image name |
+| `current_tag` | TEXT | Current image tag (mutable — updated when tag changes) |
+| `created_at` | TIMESTAMPTZ | Row creation timestamp |
+
+### `scans`
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL | Primary key |
+| `component_id` | INTEGER | FK → `components.id` |
+| `week` | TEXT | ISO week string, e.g. `2025-W04` |
+| `scanned_at` | TIMESTAMPTZ | Exact timestamp of the scan run |
+| `vuln_count` | INTEGER | Number of vulnerabilities found |
+| `scanned_tag` | TEXT | Image tag that was actually scanned (snapshot — unaffected by future tag changes) |
+
+### `vulnerabilities`
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL | Primary key |
+| `scan_id` | INTEGER | FK → `scans.id` |
+| `cve_id` | TEXT | CVE identifier |
+| `severity` | TEXT | Severity level (e.g. `critical`, `high`) |
+| `package_name` | TEXT | Affected package |
+| `package_version` | TEXT | Affected package version |
+| `fix_status` | TEXT | Fix availability status |
+| `cvss` | NUMERIC | CVSS score |
+| `description` | TEXT | CVE description |
+| `image_id` | TEXT | Twistlock internal image ID |
+| `image_name` | TEXT | Image name (denormalized from scan) |
