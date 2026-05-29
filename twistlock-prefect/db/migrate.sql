@@ -46,3 +46,21 @@ CREATE INDEX IF NOT EXISTS idx_vulnerabilities_scan_id
 
 CREATE INDEX IF NOT EXISTS idx_vulnerabilities_cve_id
     ON vulnerabilities (cve_id);
+
+CREATE TABLE IF NOT EXISTS project_image_mapping (
+    id         SERIAL      PRIMARY KEY,
+    project    TEXT        NOT NULL,
+    image_name TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (project, image_name)
+);
+
+CREATE TABLE IF NOT EXISTS image_tag_mapping (
+    id                       SERIAL      PRIMARY KEY,
+    project_image_mapping_id INTEGER     NOT NULL REFERENCES project_image_mapping(id) ON DELETE CASCADE,
+    image_name               TEXT        NOT NULL,
+    current_tag              TEXT        NOT NULL,
+    is_prod                  BOOLEAN     NOT NULL DEFAULT false,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (project_image_mapping_id, current_tag)
+);

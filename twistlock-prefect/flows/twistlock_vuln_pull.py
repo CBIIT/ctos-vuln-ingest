@@ -5,7 +5,9 @@ and upsert it into PostgreSQL.
 Credential loading strategy:
   - Prefect runtime (PREFECT_API_URL is set): read Prefect Variables to get
     AWS Secrets Manager ARNs, then call boto3 to retrieve the actual secrets.
+    Variables used: twistlock-secret-arn, dev-vuln-secret-arn, prod-vuln-secret-arn
   - Local dev: load from .env via python-dotenv.
+    DB_* vars are the dev DB; DB2_* vars are the prod DB.
 """
 
 from __future__ import annotations
@@ -33,8 +35,6 @@ if os.environ.get("PREFECT_API_URL"):
     from prefect.variables import Variable
 else:
     # Provide no-op stand-ins so the decorators are harmless locally.
-    # Both @flow and @task are always called with keyword args here,
-    # so they always receive zero positional args — just return the decorator.
     def flow(**kwargs):
         def decorator(fn):
             return fn
@@ -72,41 +72,53 @@ def _secret_from_aws(secret_arn: str) -> dict[str, Any]:
     return json.loads(response["SecretString"])
 
 
+def _db_target_from_secret(secret: dict[str, Any]) -> dict[str, Any]:
+    """Map an AWS Secrets Manager secret dict to a db_target dict."""
+    return {
+        "db_host": secret["host"],
+        "db_port": int(secret.get("port", 5432)),
+        "db_name": secret["dbname"],
+        "db_user": secret["username"],
+        "db_password": secret["password"],
+    }
+
+
 def get_credentials() -> dict[str, Any]:
     """
-    Return a unified credentials dict.
+    Return a unified credentials dict with db_targets — a list of two DB configs
+    (dev and prod) that the flow writes to on every run.
 
     In Prefect runtime:
-      1. Read TWISTLOCK_SECRET_ARN and DB_SECRET_ARN from Prefect Variables
-         (those Variables store the ARN string, not the secret itself).
-      2. Fetch the actual secrets from AWS Secrets Manager at runtime.
-         The Twistlock secret contains username, password, and base_url.
+      Reads three Prefect Variables:
+        - twistlock-secret-arn  → Twistlock API credentials + base_url
+        - dev-vuln-secret-arn   → dev DB (primary; also used to read components)
+        - prod-vuln-secret-arn  → prod DB
 
     Locally:
-      Load everything from .env.
+      Reads from .env:
+        - TWISTLOCK_* vars for the API
+        - DB_* vars for the dev DB
+        - DB2_* vars for the prod DB
     """
     if _is_prefect_runtime():
-        # --- Prefect / AWS path ---
-        # base_url is stored in the Twistlock secret alongside credentials
         twistlock_arn = Variable.get("twistlock-secret-arn")
-        db_arn = Variable.get("db-secret-arn")
+        dev_arn       = Variable.get("dev-vuln-secret-arn")
+        prod_arn      = Variable.get("prod-vuln-secret-arn")
 
-        tw_secret = _secret_from_aws(twistlock_arn)
-        db_secret = _secret_from_aws(db_arn)
+        tw_secret   = _secret_from_aws(twistlock_arn)
+        dev_secret  = _secret_from_aws(dev_arn)
+        prod_secret = _secret_from_aws(prod_arn)
 
         return {
             "twistlock_base_url": tw_secret["base_url"],
             "twistlock_username": tw_secret["username"],
             "twistlock_password": tw_secret["password"],
-            "db_host": db_secret["host"],
-            "db_port": int(db_secret.get("port", 5432)),
-            "db_name": db_secret["dbname"],
-            "db_user": db_secret["username"],
-            "db_password": db_secret["password"],
+            "db_targets": [
+                _db_target_from_secret(dev_secret),
+                _db_target_from_secret(prod_secret),
+            ],
         }
     else:
-        # --- Local .env path ---
-        # Walk up from cwd until we find the .env file
         _repo_root = next(
             p for p in [Path.cwd(), *Path.cwd().parents] if (p / ".env").exists()
         )
@@ -115,11 +127,22 @@ def get_credentials() -> dict[str, Any]:
             "twistlock_base_url": env["TWISTLOCK_BASE_URL"],
             "twistlock_username": env["TWISTLOCK_USERNAME"],
             "twistlock_password": env["TWISTLOCK_PASSWORD"],
-            "db_host": env["DB_HOST"],
-            "db_port": int(env.get("DB_PORT", 5432)),
-            "db_name": env["DB_NAME"],
-            "db_user": env["DB_USER"],
-            "db_password": env["DB_PASSWORD"],
+            "db_targets": [
+                {
+                    "db_host": env["DB_HOST"],
+                    "db_port": int(env.get("DB_PORT", 5432)),
+                    "db_name": env["DB_NAME"],
+                    "db_user": env["DB_USER"],
+                    "db_password": env["DB_PASSWORD"],
+                },
+                {
+                    "db_host": env["DB2_HOST"],
+                    "db_port": int(env.get("DB2_PORT", 5432)),
+                    "db_name": env["DB2_NAME"],
+                    "db_user": env["DB2_USER"],
+                    "db_password": env["DB2_PASSWORD"],
+                },
+            ],
         }
 
 
@@ -160,33 +183,8 @@ def _build_search_param(image_name: str, image_tag: str) -> str:
     return encoded.replace(".", "%5C.").replace("%3A", "%253A")
 
 
-def _resolve_registry(base: str, image_name: str, image_tag: str, headers: dict) -> str | None:
-    """
-    GET /api/v1/registry to find the registry host for an image:tag.
-    Returns the registry string (e.g. 986019062625.dkr.ecr.us-east-1.amazonaws.com)
-    or None if not found.
-    """
-    search = _build_search_param(image_name, image_tag)
-    url = (
-        f"{base}/api/v1/registry"
-        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=17&offset=0"
-        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=vulnerabilityRiskScore"
-    )
-    resp = requests.get(url, headers=headers, timeout=60, verify=False)
-    if resp.status_code != 200 or resp.text.strip() in ("null", ""):
-        return None
-    items = resp.json() or []
-    match = next(
-        (i for i in items
-         if i.get("repoTag", {}).get("repo") == image_name
-         and i.get("repoTag", {}).get("tag") == image_tag),
-        None,
-    )
-    return match["repoTag"]["registry"] if match else None
-
-
 # ---------------------------------------------------------------------------
-# Prefect tasks (decorators are no-ops when running locally as a plain script)
+# Prefect tasks
 # ---------------------------------------------------------------------------
 
 @task(name="authenticate-twistlock", retries=2, retry_delay_seconds=10)
@@ -201,10 +199,12 @@ def authenticate_twistlock(creds: dict[str, Any]) -> str:
 @task(name="fetch-components-from-db")
 def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Read the component list from the components table.
+    Read the component list from the dev DB (db_targets[0]).
     Returns rows as dicts with keys: id, project, image_name, current_tag.
     """
-    conn = _db_connect(creds)
+    target = creds["db_targets"][0]
+    logger.info("Fetching components from %s/%s", target["db_host"], target["db_name"])
+    conn = _db_connect(target)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -245,17 +245,18 @@ def pull_scan_data(
         f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=vulnerabilityRiskScore"
     )
 
+    logger.info("[%s] Pulling scan data for %s:%s", component["project"], image_name, image_tag)
     resp = requests.get(url, headers=headers, timeout=60, verify=False)
 
     # Re-auth once on token expiry
     if resp.status_code == 401:
-        logger.warning("Got 401 for %s; re-authenticating", image_name)
+        logger.warning("[%s] Got 401 for %s; re-authenticating", component["project"], image_name)
         token = _authenticate(creds)
         headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(url, headers=headers, timeout=60, verify=False)
 
     if resp.status_code != 200:
-        logger.error("Twistlock API error for %s: %s %s", image_name, resp.status_code, resp.text)
+        logger.error("[%s] Twistlock API error for %s: HTTP %s", component["project"], image_name, resp.status_code)
         return None
 
     results = resp.json() or []
@@ -266,12 +267,12 @@ def pull_scan_data(
         None,
     )
     if not match:
-        logger.warning("No scan result matched %s:%s in response", image_name, image_tag)
+        logger.warning("[%s] No scan result matched %s:%s in Twistlock response", component["project"], image_name, image_tag)
         return None
 
     vulns = match.get("vulnerabilities") or []
     if not vulns:
-        logger.warning("No vulnerabilities in scan for %s:%s", image_name, image_tag)
+        logger.warning("[%s] No vulnerabilities found in scan for %s:%s", component["project"], image_name, image_tag)
         return None
 
     # Attach image metadata to each vuln for DB insertion
@@ -279,7 +280,7 @@ def pull_scan_data(
         v["_image_id"]   = match.get("_id", "")
         v["_image_name"] = image_name
 
-    logger.info("Fetched %d vulnerabilities for %s", len(vulns), image_name)
+    logger.info("[%s] Found %d vulnerabilities for %s:%s", component["project"], len(vulns), image_name, image_tag)
     return vulns
 
 
@@ -290,76 +291,134 @@ def insert_scan(
     vulns: list[dict[str, Any]],
 ) -> None:
     """
-    Insert a new scan record (scans table) and linked vulnerability rows.
-    Every run is stored independently — multiple runs in the same week are all kept.
+    Write scan data to all DB targets. Each target receives:
+      - a new scans row + vulnerability rows (append-only, intentional)
+      - upserts into project_image_mapping and image_tag_mapping
+    Fails the flow if any DB write fails.
     """
-    scan_week = _current_iso_week()
-    conn = _db_connect(creds)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO scans (component_id, week, scanned_at, vuln_count, scanned_tag)
-                    VALUES (%s, %s, %s, %s, %s)
-                    RETURNING id
-                    """,
-                    (
-                        component["id"],
-                        scan_week,
-                        datetime.now(timezone.utc),
-                        len(vulns),
-                        component["current_tag"],
-                    ),
-                )
-                scan_id = cur.fetchone()[0]
-
-                # Bulk-insert vulnerabilities
-                for v in vulns:
-                    cur.execute(
-                        """
-                        INSERT INTO vulnerabilities (
-                            scan_id, cve_id, severity, package_name, package_version,
-                            fix_status, cvss, description, image_id, image_name
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (
-                            scan_id,
-                            v.get("cve"),
-                            v.get("severity"),
-                            v.get("packageName"),
-                            v.get("packageVersion"),
-                            v.get("status"),
-                            v.get("cvss"),
-                            v.get("description"),
-                            v.get("_image_id"),
-                            v.get("_image_name"),
-                        ),
-                    )
+    for db_target in creds["db_targets"]:
         logger.info(
-            "Inserted scan %s for component %s (week %s, %d vulns)",
-            scan_id,
+            "[%s] Writing scan for %s:%s to %s/%s",
+            component["project"],
             component["image_name"],
-            scan_week,
-            len(vulns),
+            component["current_tag"],
+            db_target["db_host"],
+            db_target["db_name"],
         )
-    finally:
-        conn.close()
+        conn = _db_connect(db_target)
+        try:
+            _write_scan_to_db(conn, component, vulns)
+            logger.info(
+                "[%s] Successfully wrote %d vulns for %s to %s/%s",
+                component["project"],
+                len(vulns),
+                component["image_name"],
+                db_target["db_host"],
+                db_target["db_name"],
+            )
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _db_connect(creds: dict[str, Any]):
-    """Open and return a psycopg2 connection."""
+def _db_connect(db_target: dict[str, Any]):
+    """Open and return a psycopg2 connection from a db_target dict."""
     return psycopg2.connect(
-        host=creds["db_host"],
-        port=creds["db_port"],
-        dbname=creds["db_name"],
-        user=creds["db_user"],
-        password=creds["db_password"],
+        host=db_target["db_host"],
+        port=db_target["db_port"],
+        dbname=db_target["db_name"],
+        user=db_target["db_user"],
+        password=db_target["db_password"],
         connect_timeout=10,
+    )
+
+
+def _write_scan_to_db(
+    conn,
+    component: dict[str, Any],
+    vulns: list[dict[str, Any]],
+) -> None:
+    """
+    Write one component's scan results to a single DB connection in one transaction:
+      1. Insert scans row
+      2. Bulk-insert vulnerabilities rows
+      3. Upsert project_image_mapping
+      4. Upsert image_tag_mapping
+    """
+    scan_week = _current_iso_week()
+    with conn:
+        with conn.cursor() as cur:
+            # 1. Insert scan record
+            cur.execute(
+                """
+                INSERT INTO scans (component_id, week, scanned_at, vuln_count, scanned_tag)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    component["id"],
+                    scan_week,
+                    datetime.now(timezone.utc),
+                    len(vulns),
+                    component["current_tag"],
+                ),
+            )
+            scan_id = cur.fetchone()[0]
+
+            # 2. Bulk-insert vulnerabilities
+            for v in vulns:
+                cur.execute(
+                    """
+                    INSERT INTO vulnerabilities (
+                        scan_id, cve_id, severity, package_name, package_version,
+                        fix_status, cvss, description, image_id, image_name
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        scan_id,
+                        v.get("cve"),
+                        v.get("severity"),
+                        v.get("packageName"),
+                        v.get("packageVersion"),
+                        v.get("status"),
+                        v.get("cvss"),
+                        v.get("description"),
+                        v.get("_image_id"),
+                        v.get("_image_name"),
+                    ),
+                )
+
+            # 3. Upsert project_image_mapping
+            cur.execute(
+                """
+                INSERT INTO project_image_mapping (project, image_name)
+                VALUES (%s, %s)
+                ON CONFLICT (project, image_name) DO UPDATE SET project = EXCLUDED.project
+                RETURNING id
+                """,
+                (component["project"], component["image_name"]),
+            )
+            pim_id = cur.fetchone()[0]
+
+            # 4. Upsert image_tag_mapping
+            cur.execute(
+                """
+                INSERT INTO image_tag_mapping (project_image_mapping_id, image_name, current_tag, is_prod)
+                VALUES (%s, %s, %s, true)
+                ON CONFLICT (project_image_mapping_id, current_tag) DO NOTHING
+                """,
+                (pim_id, component["image_name"], component["current_tag"]),
+            )
+
+    logger.info(
+        "Inserted scan %s for component %s (week %s, %d vulns)",
+        scan_id,
+        component["image_name"],
+        scan_week,
+        len(vulns),
     )
 
 
@@ -371,14 +430,14 @@ def _current_iso_week() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Flow (decorator is a no-op locally)
+# Flow
 # ---------------------------------------------------------------------------
 
 @flow(name="twistlock-vuln-pull", log_prints=True)
 def twistlock_vuln_pull() -> None:
     """
     Weekly flow: authenticate with Twistlock, iterate over all components,
-    pull scan data, and upsert into PostgreSQL.
+    pull scan data, and write into all DB targets.
     """
     creds = get_credentials()
     token = authenticate_twistlock(creds)
@@ -388,19 +447,36 @@ def twistlock_vuln_pull() -> None:
         logger.warning("No components found in DB — nothing to scan")
         return
 
+    db_hosts = [t["db_host"] for t in creds["db_targets"]]
+    logger.info(
+        "Starting scan for %d components across %d DB target(s): %s",
+        len(components),
+        len(db_hosts),
+        ", ".join(db_hosts),
+    )
+
+    skipped, written = 0, 0
     for component in components:
         vulns = pull_scan_data(token, component, creds)
 
         if vulns:
             insert_scan(creds, component, vulns)
+            written += 1
         else:
             logger.warning(
-                "Skipping component '%s' (id=%s): no scan data from Twistlock",
+                "[%s] Skipping %s (id=%s): no scan data from Twistlock",
+                component["project"],
                 component["image_name"],
                 component["id"],
             )
+            skipped += 1
 
-    logger.info("twistlock_vuln_pull complete for week %s", _current_iso_week())
+    logger.info(
+        "twistlock_vuln_pull complete for week %s — %d written, %d skipped",
+        _current_iso_week(),
+        written,
+        skipped,
+    )
 
 
 # ---------------------------------------------------------------------------
