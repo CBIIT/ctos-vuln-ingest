@@ -54,7 +54,15 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger(__name__)
+_stdlib_logger = logging.getLogger(__name__)
+
+
+def _get_logger():
+    """Return Prefect's run logger inside a flow/task, stdlib logger otherwise."""
+    try:
+        return get_run_logger()
+    except Exception:
+        return _stdlib_logger
 
 # ---------------------------------------------------------------------------
 # Credential / config loading
@@ -190,9 +198,9 @@ def _build_search_param(image_name: str, image_tag: str) -> str:
 @task(name="authenticate-twistlock", retries=2, retry_delay_seconds=10)
 def authenticate_twistlock(creds: dict[str, Any]) -> str:
     """Obtain a Twistlock API bearer token."""
-    logger.info("Authenticating with Twistlock at %s", creds["twistlock_base_url"])
+    _get_logger().info("Authenticating with Twistlock at %s", creds["twistlock_base_url"])
     token = _authenticate(creds)
-    logger.info("Twistlock authentication successful")
+    _get_logger().info("Twistlock authentication successful")
     return token
 
 
@@ -203,7 +211,7 @@ def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
     Returns rows as dicts with keys: id, project, image_name, current_tag.
     """
     target = creds["db_targets"][0]
-    logger.info("Fetching components from %s/%s", target["db_host"], target["db_name"])
+    _get_logger().info("Fetching components from %s/%s", target["db_host"], target["db_name"])
     conn = _db_connect(target)
     try:
         with conn.cursor() as cur:
@@ -212,7 +220,7 @@ def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
             )
             cols = [desc[0] for desc in cur.description]
             rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-        logger.info("Fetched %d components from DB", len(rows))
+        _get_logger().info("Fetched %d components from DB", len(rows))
         return rows
     finally:
         conn.close()
@@ -245,18 +253,18 @@ def pull_scan_data(
         f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=vulnerabilityRiskScore"
     )
 
-    logger.info("[%s] Pulling scan data for %s:%s", component["project"], image_name, image_tag)
+    _get_logger().info("[%s] Pulling scan data for %s:%s", component["project"], image_name, image_tag)
     resp = requests.get(url, headers=headers, timeout=60, verify=False)
 
     # Re-auth once on token expiry
     if resp.status_code == 401:
-        logger.warning("[%s] Got 401 for %s; re-authenticating", component["project"], image_name)
+        _get_logger().warning("[%s] Got 401 for %s; re-authenticating", component["project"], image_name)
         token = _authenticate(creds)
         headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(url, headers=headers, timeout=60, verify=False)
 
     if resp.status_code != 200:
-        logger.error("[%s] Twistlock API error for %s: HTTP %s", component["project"], image_name, resp.status_code)
+        _get_logger().error("[%s] Twistlock API error for %s: HTTP %s", component["project"], image_name, resp.status_code)
         return None
 
     results = resp.json() or []
@@ -267,12 +275,12 @@ def pull_scan_data(
         None,
     )
     if not match:
-        logger.warning("[%s] No scan result matched %s:%s in Twistlock response", component["project"], image_name, image_tag)
+        _get_logger().warning("[%s] No scan result matched %s:%s in Twistlock response", component["project"], image_name, image_tag)
         return None
 
     vulns = match.get("vulnerabilities") or []
     if not vulns:
-        logger.warning("[%s] No vulnerabilities found in scan for %s:%s", component["project"], image_name, image_tag)
+        _get_logger().warning("[%s] No vulnerabilities found in scan for %s:%s", component["project"], image_name, image_tag)
         return None
 
     # Attach image metadata to each vuln for DB insertion
@@ -280,7 +288,7 @@ def pull_scan_data(
         v["_image_id"]   = match.get("_id", "")
         v["_image_name"] = image_name
 
-    logger.info("[%s] Found %d vulnerabilities for %s:%s", component["project"], len(vulns), image_name, image_tag)
+    _get_logger().info("[%s] Found %d vulnerabilities for %s:%s", component["project"], len(vulns), image_name, image_tag)
     return vulns
 
 
@@ -297,7 +305,7 @@ def insert_scan(
     Fails the flow if any DB write fails.
     """
     for db_target in creds["db_targets"]:
-        logger.info(
+        _get_logger().info(
             "[%s] Writing scan for %s:%s to %s/%s",
             component["project"],
             component["image_name"],
@@ -308,7 +316,7 @@ def insert_scan(
         conn = _db_connect(db_target)
         try:
             _write_scan_to_db(conn, component, vulns)
-            logger.info(
+            _get_logger().info(
                 "[%s] Successfully wrote %d vulns for %s to %s/%s",
                 component["project"],
                 len(vulns),
@@ -413,7 +421,7 @@ def _write_scan_to_db(
                 (pim_id, component["image_name"], component["current_tag"]),
             )
 
-    logger.info(
+    _get_logger().info(
         "Inserted scan %s for component %s (week %s, %d vulns)",
         scan_id,
         component["image_name"],
@@ -444,11 +452,11 @@ def twistlock_vuln_pull() -> None:
     components = fetch_components_from_db(creds)
 
     if not components:
-        logger.warning("No components found in DB — nothing to scan")
+        _get_logger().warning("No components found in DB — nothing to scan")
         return
 
     db_hosts = [t["db_host"] for t in creds["db_targets"]]
-    logger.info(
+    _get_logger().info(
         "Starting scan for %d components across %d DB target(s): %s",
         len(components),
         len(db_hosts),
@@ -463,7 +471,7 @@ def twistlock_vuln_pull() -> None:
             insert_scan(creds, component, vulns)
             written += 1
         else:
-            logger.warning(
+            _get_logger().warning(
                 "[%s] Skipping %s (id=%s): no scan data from Twistlock",
                 component["project"],
                 component["image_name"],
@@ -471,7 +479,7 @@ def twistlock_vuln_pull() -> None:
             )
             skipped += 1
 
-    logger.info(
+    _get_logger().info(
         "twistlock_vuln_pull complete for week %s — %d written, %d skipped",
         _current_iso_week(),
         written,
