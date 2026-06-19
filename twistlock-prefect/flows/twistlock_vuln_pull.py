@@ -226,6 +226,88 @@ def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
         conn.close()
 
 
+@task(name="resolve-prod-tag", retries=1, retry_delay_seconds=5)
+def resolve_prod_tag(
+    token: str,
+    image_name: str,
+    base_url: str,
+) -> str | None:
+    """
+    Query Twistlock for all scanned tags of this image and return the most recent
+    one whose tag starts with 'prod-'. Returns None if no prod- tag is found.
+    """
+    from urllib.parse import quote
+    headers = {"Authorization": f"Bearer {token}"}
+    search = quote(image_name, safe="").replace(".", "%5C.")
+    url = (
+        f"{base_url.rstrip('/')}/api/v1/registry"
+        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=50&offset=0"
+        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=vulnerabilityRiskScore"
+    )
+
+    resp = requests.get(url, headers=headers, timeout=60, verify=False)
+    if resp.status_code != 200:
+        _get_logger().warning("[resolve-prod-tag] Twistlock API returned %s for %s", resp.status_code, image_name)
+        return None
+
+    results = resp.json() or []
+    prod_entries = [
+        r for r in results
+        if r.get("repoTag", {}).get("repo") == image_name
+        and r.get("repoTag", {}).get("tag", "").startswith("prod-")
+    ]
+
+    if not prod_entries:
+        _get_logger().info("[resolve-prod-tag] No prod- tag found in Twistlock for %s", image_name)
+        return None
+
+    # Pick the entry with the most recent scanTime
+    prod_entries.sort(key=lambda r: r.get("scanTime", ""), reverse=True)
+    chosen = prod_entries[0]["repoTag"]["tag"]
+    _get_logger().info("[resolve-prod-tag] Resolved prod tag for %s: %s", image_name, chosen)
+    return chosen
+
+
+@task(name="update-component-tag")
+def update_component_tag(
+    creds: dict[str, Any],
+    component: dict[str, Any],
+    new_tag: str,
+) -> None:
+    """
+    Update components.current_tag to new_tag across all DB targets.
+    Archives the old tag in components_history first.
+    """
+    for db_target in creds["db_targets"]:
+        conn = _db_connect(db_target)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO components_history (component_id, old_tag)
+                        VALUES (%s, %s)
+                        """,
+                        (component["id"], component["current_tag"]),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE components SET current_tag = %s WHERE id = %s
+                        """,
+                        (new_tag, component["id"]),
+                    )
+            _get_logger().info(
+                "[%s] Updated %s tag: %s → %s on %s",
+                component["project"],
+                component["image_name"],
+                component["current_tag"],
+                new_tag,
+                db_target["db_host"],
+            )
+        finally:
+            conn.close()
+
+
 @task(name="pull-scan-data", retries=1, retry_delay_seconds=5)
 def pull_scan_data(
     token: str,
@@ -411,14 +493,15 @@ def _write_scan_to_db(
             )
             pim_id = cur.fetchone()[0]
 
-            # 4. Upsert image_tag_mapping
+            # 4. Upsert image_tag_mapping — is_prod only when tag starts with "prod-"
+            is_prod = component["current_tag"].startswith("prod-")
             cur.execute(
                 """
                 INSERT INTO image_tag_mapping (project_image_mapping_id, image_name, current_tag, is_prod)
-                VALUES (%s, %s, %s, true)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (project_image_mapping_id, current_tag) DO NOTHING
                 """,
-                (pim_id, component["image_name"], component["current_tag"]),
+                (pim_id, component["image_name"], component["current_tag"], is_prod),
             )
 
     _get_logger().info(
@@ -444,8 +527,9 @@ def _current_iso_week() -> str:
 @flow(name="twistlock-vuln-pull", log_prints=True)
 def twistlock_vuln_pull() -> None:
     """
-    Weekly flow: authenticate with Twistlock, iterate over all components,
-    pull scan data, and write into all DB targets.
+    Daily flow: authenticate with Twistlock, auto-resolve prod- tags for each
+    component, update the DB if a newer prod tag is found, pull scan data,
+    and write into all DB targets.
     """
     creds = get_credentials()
     token = authenticate_twistlock(creds)
@@ -463,8 +547,24 @@ def twistlock_vuln_pull() -> None:
         ", ".join(db_hosts),
     )
 
-    skipped, written = 0, 0
+    skipped, written, tag_updates = 0, 0, 0
+    base_url = creds["twistlock_base_url"]
+
     for component in components:
+        # Attempt to resolve a prod- tag from Twistlock before scanning
+        resolved_tag = resolve_prod_tag(token, component["image_name"], base_url)
+        if resolved_tag and resolved_tag != component["current_tag"]:
+            _get_logger().info(
+                "[%s] Updating tag for %s: %s → %s",
+                component["project"],
+                component["image_name"],
+                component["current_tag"],
+                resolved_tag,
+            )
+            update_component_tag(creds, component, resolved_tag)
+            component = {**component, "current_tag": resolved_tag}
+            tag_updates += 1
+
         vulns = pull_scan_data(token, component, creds)
 
         if vulns:
@@ -480,10 +580,11 @@ def twistlock_vuln_pull() -> None:
             skipped += 1
 
     _get_logger().info(
-        "twistlock_vuln_pull complete for week %s — %d written, %d skipped",
+        "twistlock_vuln_pull complete for week %s — %d written, %d skipped, %d tag(s) updated",
         _current_iso_week(),
         written,
         skipped,
+        tag_updates,
     )
 
 
