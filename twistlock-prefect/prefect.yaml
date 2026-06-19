@@ -16,7 +16,7 @@ pull:
 
 deployments:
   - name: twistlock-daily-pull
-    entrypoint: twistlock-prefect/flows/twistlock_vuln_pull.py:twistlock_vuln_pull
+    entrypoint: flows/twistlock_vuln_pull.py:twistlock_vuln_pull
     schedule:
       cron: "0 10 * * *"   # Daily 10:00 UTC = 06:00 ET
       timezone: America/New_York

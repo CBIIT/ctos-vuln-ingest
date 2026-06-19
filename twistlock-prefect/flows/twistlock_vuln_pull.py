@@ -28,13 +28,11 @@ from dotenv import dotenv_values
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Prefect imports are only needed when running inside a Prefect worker.
-# Importing them locally would require a running Prefect server.
-if os.environ.get("PREFECT_API_URL"):
+try:
     from prefect import flow, get_run_logger, task
     from prefect.variables import Variable
-else:
-    # Provide no-op stand-ins so the decorators are harmless locally.
+except ImportError:
+    # No-op stand-ins so the file can be imported without a Prefect installation.
     def flow(**kwargs):
         def decorator(fn):
             return fn
@@ -48,7 +46,7 @@ else:
     def get_run_logger():
         return logging.getLogger(__name__)
 
-    Variable = None  # never accessed outside Prefect runtime
+    Variable = None
 
 logging.basicConfig(
     level=logging.INFO,
