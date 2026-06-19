@@ -30,6 +30,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
     from prefect import flow, get_run_logger, task
+    from prefect.artifacts import create_markdown_artifact, create_table_artifact
     from prefect.variables import Variable
 except ImportError:
     # No-op stand-ins so the file can be imported without a Prefect installation.
@@ -45,6 +46,12 @@ except ImportError:
 
     def get_run_logger():
         return logging.getLogger(__name__)
+
+    def create_table_artifact(**kwargs):
+        pass
+
+    def create_markdown_artifact(**kwargs):
+        pass
 
     Variable = None
 
@@ -239,8 +246,8 @@ def resolve_prod_tag(
     search = quote(image_name, safe="").replace(".", "%5C.")
     url = (
         f"{base_url.rstrip('/')}/api/v1/registry"
-        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=50&offset=0"
-        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=vulnerabilityRiskScore"
+        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=100&offset=0"
+        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=scanTime"
     )
 
     resp = requests.get(url, headers=headers, timeout=60, verify=False)
@@ -547,27 +554,39 @@ def twistlock_vuln_pull() -> None:
 
     skipped, written, tag_updates = 0, 0, 0
     base_url = creds["twistlock_base_url"]
+    summary_rows = []
 
     for component in components:
         # Attempt to resolve a prod- tag from Twistlock before scanning
-        resolved_tag = resolve_prod_tag(token, component["image_name"], base_url)
-        if resolved_tag and resolved_tag != component["current_tag"]:
+        image_name = component["image_name"]
+        old_tag = component["current_tag"]
+        resolved_tag = resolve_prod_tag.with_options(name=f"resolve-prod-tag/{image_name}")(token, image_name, base_url)
+        tag_changed = False
+        if resolved_tag and resolved_tag != old_tag:
             _get_logger().info(
                 "[%s] Updating tag for %s: %s → %s",
                 component["project"],
-                component["image_name"],
-                component["current_tag"],
+                image_name,
+                old_tag,
                 resolved_tag,
             )
-            update_component_tag(creds, component, resolved_tag)
+            update_component_tag.with_options(name=f"update-component-tag/{image_name}")(creds, component, resolved_tag)
             component = {**component, "current_tag": resolved_tag}
             tag_updates += 1
+            tag_changed = True
 
-        vulns = pull_scan_data(token, component, creds)
+        vulns = pull_scan_data.with_options(name=f"pull-scan-data/{image_name}")(token, component, creds)
 
         if vulns:
-            insert_scan(creds, component, vulns)
+            insert_scan.with_options(name=f"insert-scan/{image_name}")(creds, component, vulns)
             written += 1
+            summary_rows.append({
+                "project": component["project"],
+                "image": image_name,
+                "tag": component["current_tag"],
+                "tag_updated": f"yes → {old_tag}" if tag_changed else "no",
+                "vulns_written": len(vulns),
+            })
         else:
             _get_logger().warning(
                 "[%s] Skipping %s (id=%s): no scan data from Twistlock",
@@ -576,6 +595,33 @@ def twistlock_vuln_pull() -> None:
                 component["id"],
             )
             skipped += 1
+            summary_rows.append({
+                "project": component["project"],
+                "image": image_name,
+                "tag": component["current_tag"],
+                "tag_updated": f"yes → {old_tag}" if tag_changed else "no",
+                "vulns_written": "skipped",
+            })
+
+    run_date = date.today().isoformat()
+    create_table_artifact(
+        key="scan-summary",
+        table=summary_rows,
+        description=f"Vulnerability scan summary for {run_date} (week {_current_iso_week()})",
+    )
+    create_markdown_artifact(
+        key="scan-stats",
+        markdown=f"""## Scan run: {run_date}
+
+| Metric | Value |
+|---|---|
+| Week | {_current_iso_week()} |
+| Components scanned | {written} |
+| Components skipped | {skipped} |
+| Tags auto-updated | {tag_updates} |
+| Total components | {len(components)} |
+""",
+    )
 
     _get_logger().info(
         "twistlock_vuln_pull complete for week %s — %d written, %d skipped, %d tag(s) updated",
