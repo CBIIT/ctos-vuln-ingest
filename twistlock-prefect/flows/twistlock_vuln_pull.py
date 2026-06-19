@@ -247,7 +247,7 @@ def resolve_prod_tag(
     url = (
         f"{base_url.rstrip('/')}/api/v1/registry"
         f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=100&offset=0"
-        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=scanTime"
+        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=id"
     )
 
     resp = requests.get(url, headers=headers, timeout=60, verify=False)
@@ -266,8 +266,9 @@ def resolve_prod_tag(
         _get_logger().info("[resolve-prod-tag] No prod- tag found in Twistlock for %s", image_name)
         return None
 
-    # Pick the entry with the most recent scanTime
-    prod_entries.sort(key=lambda r: r.get("scanTime", ""), reverse=True)
+    # Pick the entry with the most recent creationTime (when the image was pushed)
+    # scanTime reflects when Twistlock last scanned it and can be misleading for ordering
+    prod_entries.sort(key=lambda r: r.get("creationTime", ""), reverse=True)
     chosen = prod_entries[0]["repoTag"]["tag"]
     _get_logger().info("[resolve-prod-tag] Resolved prod tag for %s: %s", image_name, chosen)
     return chosen
