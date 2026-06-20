@@ -166,6 +166,10 @@ def get_credentials() -> dict[str, Any]:
 _REGISTRY_COLLECTION = "CRDC+CCDI+All+Collection"
 _REGISTRY_PROJECT    = "Central+Console"
 
+# ECR registry hosting all application images
+_ECR_REGISTRY_ID = "986019062625"
+_ECR_REGION      = "us-east-1"
+
 class TwistlockAuthError(Exception):
     pass
 
@@ -231,6 +235,66 @@ def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
         conn.close()
 
 
+def _ecr_latest_prod_tag(image_name: str) -> str | None:
+    """
+    Query ECR for all tags on this repository that start with 'prod-' and return
+    the one on the most recently pushed image (by imagePushedAt). Returns None if
+    no prod- tagged image exists or the repository is not found.
+    """
+    ecr = boto3.client("ecr", region_name=_ECR_REGION)
+    try:
+        paginator = ecr.get_paginator("describe_images")
+        pages = paginator.paginate(
+            registryId=_ECR_REGISTRY_ID,
+            repositoryName=image_name,
+            filter={"tagStatus": "TAGGED"},
+        )
+        prod_images = []
+        for page in pages:
+            for detail in page.get("imageDetails", []):
+                prod_tags = [t for t in detail.get("imageTags", []) if t.startswith("prod-")]
+                if prod_tags:
+                    # Use the first prod- tag found on this image digest
+                    prod_images.append((detail["imagePushedAt"], prod_tags[0]))
+
+        if not prod_images:
+            return None
+
+        prod_images.sort(key=lambda x: x[0], reverse=True)
+        return prod_images[0][1]
+
+    except ecr.exceptions.RepositoryNotFoundException:
+        _get_logger().warning("[resolve-prod-tag] ECR repository not found: %s", image_name)
+        return None
+    except Exception as e:
+        _get_logger().warning("[resolve-prod-tag] ECR lookup failed for %s: %s", image_name, e)
+        return None
+
+
+def _twistlock_has_tag(image_name: str, tag: str, token: str, base_url: str) -> bool:
+    """
+    Return True if Twistlock has a scan result for image_name:tag.
+    Used to gate ECR-resolved tags — we only update if Twistlock has scanned it.
+    """
+    from urllib.parse import quote
+    headers = {"Authorization": f"Bearer {token}"}
+    search = quote(f"{image_name}:{tag}", safe="").replace(".", "%5C.").replace("%3A", "%253A")
+    url = (
+        f"{base_url.rstrip('/')}/api/v1/registry"
+        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=5&offset=0"
+        f"&project={_REGISTRY_PROJECT}&search={search}"
+    )
+    resp = requests.get(url, headers=headers, timeout=30, verify=False)
+    if resp.status_code != 200:
+        return False
+    results = resp.json() or []
+    return any(
+        r.get("repoTag", {}).get("repo") == image_name
+        and r.get("repoTag", {}).get("tag") == tag
+        for r in results
+    )
+
+
 @task(name="resolve-prod-tag", retries=1, retry_delay_seconds=5)
 def resolve_prod_tag(
     token: str,
@@ -238,40 +302,26 @@ def resolve_prod_tag(
     base_url: str,
 ) -> str | None:
     """
-    Query Twistlock for all scanned tags of this image and return the most recent
-    one whose tag starts with 'prod-'. Returns None if no prod- tag is found.
+    Resolve the latest prod- tag for an image using ECR as the source of truth
+    (sorted by imagePushedAt), then validate it exists in Twistlock before returning.
+    Falls back to None if ECR has no prod- tag or Twistlock hasn't scanned it yet.
     """
-    from urllib.parse import quote
-    headers = {"Authorization": f"Bearer {token}"}
-    search = quote(image_name, safe="").replace(".", "%5C.")
-    url = (
-        f"{base_url.rstrip('/')}/api/v1/registry"
-        f"?collections={_REGISTRY_COLLECTION}&compact=true&limit=100&offset=0"
-        f"&project={_REGISTRY_PROJECT}&reverse=true&search={search}&sort=id"
-    )
-
-    resp = requests.get(url, headers=headers, timeout=60, verify=False)
-    if resp.status_code != 200:
-        _get_logger().warning("[resolve-prod-tag] Twistlock API returned %s for %s", resp.status_code, image_name)
+    ecr_tag = _ecr_latest_prod_tag(image_name)
+    if not ecr_tag:
+        _get_logger().info("[resolve-prod-tag] No prod- tag found in ECR for %s", image_name)
         return None
 
-    results = resp.json() or []
-    prod_entries = [
-        r for r in results
-        if r.get("repoTag", {}).get("repo") == image_name
-        and r.get("repoTag", {}).get("tag", "").startswith("prod-")
-    ]
+    _get_logger().info("[resolve-prod-tag] ECR latest prod tag for %s: %s — checking Twistlock", image_name, ecr_tag)
 
-    if not prod_entries:
-        _get_logger().info("[resolve-prod-tag] No prod- tag found in Twistlock for %s", image_name)
+    if not _twistlock_has_tag(image_name, ecr_tag, token, base_url):
+        _get_logger().warning(
+            "[resolve-prod-tag] %s:%s not yet scanned in Twistlock — skipping update",
+            image_name, ecr_tag,
+        )
         return None
 
-    # Pick the entry with the most recent creationTime (when the image was pushed)
-    # scanTime reflects when Twistlock last scanned it and can be misleading for ordering
-    prod_entries.sort(key=lambda r: r.get("creationTime", ""), reverse=True)
-    chosen = prod_entries[0]["repoTag"]["tag"]
-    _get_logger().info("[resolve-prod-tag] Resolved prod tag for %s: %s", image_name, chosen)
-    return chosen
+    _get_logger().info("[resolve-prod-tag] Confirmed %s:%s in Twistlock", image_name, ecr_tag)
+    return ecr_tag
 
 
 @task(name="update-component-tag")
