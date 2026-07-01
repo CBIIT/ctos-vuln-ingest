@@ -649,6 +649,7 @@ def _scan_db_target(
                 "vulns_written": "skipped",
             })
 
+    summary_rows.sort(key=lambda r: (r["project"], r["image"]))
     return summary_rows, written, skipped, tag_updates
 
 
