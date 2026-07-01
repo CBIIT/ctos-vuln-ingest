@@ -635,7 +635,7 @@ def twistlock_vuln_pull() -> None:
                 "project": component["project"],
                 "image": image_name,
                 "tag": component["current_tag"],
-                "tag_updated": f"yes → {old_tag}" if tag_changed else "no",
+                "tag_updated": f"yes → {component['current_tag']}" if tag_changed else "no",
                 "vulns_written": len(vulns),
             })
         else:
@@ -650,7 +650,7 @@ def twistlock_vuln_pull() -> None:
                 "project": component["project"],
                 "image": image_name,
                 "tag": component["current_tag"],
-                "tag_updated": f"yes → {old_tag}" if tag_changed else "no",
+                "tag_updated": f"yes → {component['current_tag']}" if tag_changed else "no",
                 "vulns_written": "skipped",
             })
 
