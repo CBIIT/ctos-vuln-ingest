@@ -214,14 +214,13 @@ def authenticate_twistlock(creds: dict[str, Any]) -> str:
 
 
 @task(name="fetch-components-from-db")
-def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
+def fetch_components_from_db(db_target: dict[str, Any]) -> list[dict[str, Any]]:
     """
-    Read the component list from the dev DB (db_targets[0]).
+    Read the component list from a single DB target.
     Returns rows as dicts with keys: id, project, image_name, current_tag.
     """
-    target = creds["db_targets"][0]
-    _get_logger().info("Fetching components from %s/%s", target["db_host"], target["db_name"])
-    conn = _db_connect(target)
+    _get_logger().info("Fetching components from %s/%s", db_target["db_host"], db_target["db_name"])
+    conn = _db_connect(db_target)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -229,7 +228,7 @@ def fetch_components_from_db(creds: dict[str, Any]) -> list[dict[str, Any]]:
             )
             cols = [desc[0] for desc in cur.description]
             rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-        _get_logger().info("Fetched %d components from DB", len(rows))
+        _get_logger().info("Fetched %d components from %s/%s", len(rows), db_target["db_host"], db_target["db_name"])
         return rows
     finally:
         conn.close()
@@ -326,49 +325,49 @@ def resolve_prod_tag(
 
 @task(name="update-component-tag")
 def update_component_tag(
-    creds: dict[str, Any],
+    db_target: dict[str, Any],
     component: dict[str, Any],
     new_tag: str,
 ) -> None:
     """
-    Update components.current_tag to new_tag across all DB targets.
+    Update components.current_tag to new_tag in a single DB target.
     Archives the old tag in components_history first.
     """
-    for db_target in creds["db_targets"]:
-        conn = _db_connect(db_target)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO components_history (component_id, old_tag)
-                        VALUES (%s, %s)
-                        """,
-                        (component["id"], component["current_tag"]),
-                    )
-                    cur.execute(
-                        """
-                        UPDATE components SET current_tag = %s WHERE id = %s
-                        """,
-                        (new_tag, component["id"]),
-                    )
-            _get_logger().info(
-                "[%s] Updated %s tag: %s → %s on %s",
-                component["project"],
-                component["image_name"],
-                component["current_tag"],
-                new_tag,
-                db_target["db_host"],
-            )
-        finally:
-            conn.close()
+    conn = _db_connect(db_target)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO components_history (component_id, old_tag)
+                    VALUES (%s, %s)
+                    """,
+                    (component["id"], component["current_tag"]),
+                )
+                cur.execute(
+                    """
+                    UPDATE components SET current_tag = %s WHERE id = %s
+                    """,
+                    (new_tag, component["id"]),
+                )
+        _get_logger().info(
+            "[%s] Updated %s tag: %s → %s on %s",
+            component["project"],
+            component["image_name"],
+            component["current_tag"],
+            new_tag,
+            db_target["db_host"],
+        )
+    finally:
+        conn.close()
 
 
 @task(name="pull-scan-data", retries=1, retry_delay_seconds=5)
 def pull_scan_data(
     token: str,
     component: dict[str, Any],
-    creds: dict[str, Any],
+    base_url: str,
+    twistlock_creds: dict[str, Any],
 ) -> list[dict[str, Any]] | None:
     """
     Single-call Twistlock lookup:
@@ -379,7 +378,7 @@ def pull_scan_data(
     Re-authenticates once on 401 (token expiry).
     Returns the flat list of vulnerability dicts, or None if no data found.
     """
-    base = creds["twistlock_base_url"].rstrip("/")
+    base = base_url.rstrip("/")
     image_name = component["image_name"]
     image_tag  = component["current_tag"]
     headers    = {"Authorization": f"Bearer {token}"}
@@ -397,7 +396,7 @@ def pull_scan_data(
     # Re-auth once on token expiry
     if resp.status_code == 401:
         _get_logger().warning("[%s] Got 401 for %s; re-authenticating", component["project"], image_name)
-        token = _authenticate(creds)
+        token = _authenticate(twistlock_creds)
         headers["Authorization"] = f"Bearer {token}"
         resp = requests.get(url, headers=headers, timeout=60, verify=False)
 
@@ -432,38 +431,37 @@ def pull_scan_data(
 
 @task(name="insert-scan")
 def insert_scan(
-    creds: dict[str, Any],
+    db_target: dict[str, Any],
     component: dict[str, Any],
     vulns: list[dict[str, Any]],
 ) -> None:
     """
-    Write scan data to all DB targets. Each target receives:
+    Write scan data to a single DB target:
       - a new scans row + vulnerability rows (append-only, intentional)
       - upserts into project_image_mapping and image_tag_mapping
-    Fails the flow if any DB write fails.
+    Fails the flow if the DB write fails.
     """
-    for db_target in creds["db_targets"]:
+    _get_logger().info(
+        "[%s] Writing scan for %s:%s to %s/%s",
+        component["project"],
+        component["image_name"],
+        component["current_tag"],
+        db_target["db_host"],
+        db_target["db_name"],
+    )
+    conn = _db_connect(db_target)
+    try:
+        _write_scan_to_db(conn, component, vulns)
         _get_logger().info(
-            "[%s] Writing scan for %s:%s to %s/%s",
+            "[%s] Successfully wrote %d vulns for %s to %s/%s",
             component["project"],
+            len(vulns),
             component["image_name"],
-            component["current_tag"],
             db_target["db_host"],
             db_target["db_name"],
         )
-        conn = _db_connect(db_target)
-        try:
-            _write_scan_to_db(conn, component, vulns)
-            _get_logger().info(
-                "[%s] Successfully wrote %d vulns for %s to %s/%s",
-                component["project"],
-                len(vulns),
-                component["image_name"],
-                db_target["db_host"],
-                db_target["db_name"],
-            )
-        finally:
-            conn.close()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -580,56 +578,52 @@ def _current_iso_week() -> str:
 # Flow
 # ---------------------------------------------------------------------------
 
-@flow(name="twistlock-vuln-pull", log_prints=True)
-def twistlock_vuln_pull() -> None:
+def _scan_db_target(
+    db_target: dict[str, Any],
+    token: str,
+    twistlock_creds: dict[str, Any],
+    base_url: str,
+    db_label: str,
+) -> tuple[list[dict], int, int, int]:
     """
-    Daily flow: authenticate with Twistlock, auto-resolve prod- tags for each
-    component, update the DB if a newer prod tag is found, pull scan data,
-    and write into all DB targets.
+    Run the full scan loop for a single DB target. Reads components from that DB,
+    resolves tags, pulls scan data, and writes results back to the same DB.
+    Returns (summary_rows, written, skipped, tag_updates).
     """
-    creds = get_credentials()
-    token = authenticate_twistlock(creds)
-    components = fetch_components_from_db(creds)
+    components = fetch_components_from_db.with_options(name=f"fetch-components-from-db/{db_label}")(db_target)
 
     if not components:
-        _get_logger().warning("No components found in DB — nothing to scan")
-        return
+        _get_logger().warning("[%s] No components found — nothing to scan", db_label)
+        return [], 0, 0, 0
 
-    db_hosts = [t["db_host"] for t in creds["db_targets"]]
-    _get_logger().info(
-        "Starting scan for %d components across %d DB target(s): %s",
-        len(components),
-        len(db_hosts),
-        ", ".join(db_hosts),
-    )
+    _get_logger().info("[%s] Starting scan for %d components", db_label, len(components))
 
     skipped, written, tag_updates = 0, 0, 0
-    base_url = creds["twistlock_base_url"]
     summary_rows = []
 
     for component in components:
-        # Attempt to resolve a prod- tag from Twistlock before scanning
         image_name = component["image_name"]
         old_tag = component["current_tag"]
-        resolved_tag = resolve_prod_tag.with_options(name=f"resolve-prod-tag/{image_name}")(token, image_name, base_url)
+        resolved_tag = resolve_prod_tag.with_options(name=f"resolve-prod-tag/{db_label}/{image_name}")(token, image_name, base_url)
         tag_changed = False
         if resolved_tag and resolved_tag != old_tag:
             _get_logger().info(
-                "[%s] Updating tag for %s: %s → %s",
+                "[%s][%s] Updating tag for %s: %s → %s",
+                db_label,
                 component["project"],
                 image_name,
                 old_tag,
                 resolved_tag,
             )
-            update_component_tag.with_options(name=f"update-component-tag/{image_name}")(creds, component, resolved_tag)
+            update_component_tag.with_options(name=f"update-component-tag/{db_label}/{image_name}")(db_target, component, resolved_tag)
             component = {**component, "current_tag": resolved_tag}
             tag_updates += 1
             tag_changed = True
 
-        vulns = pull_scan_data.with_options(name=f"pull-scan-data/{image_name}")(token, component, creds)
+        vulns = pull_scan_data.with_options(name=f"pull-scan-data/{db_label}/{image_name}")(token, component, base_url, twistlock_creds)
 
         if vulns:
-            insert_scan.with_options(name=f"insert-scan/{image_name}")(creds, component, vulns)
+            insert_scan.with_options(name=f"insert-scan/{db_label}/{image_name}")(db_target, component, vulns)
             written += 1
             summary_rows.append({
                 "project": component["project"],
@@ -640,7 +634,8 @@ def twistlock_vuln_pull() -> None:
             })
         else:
             _get_logger().warning(
-                "[%s] Skipping %s (id=%s): no scan data from Twistlock",
+                "[%s][%s] Skipping %s (id=%s): no scan data from Twistlock",
+                db_label,
                 component["project"],
                 component["image_name"],
                 component["id"],
@@ -654,15 +649,42 @@ def twistlock_vuln_pull() -> None:
                 "vulns_written": "skipped",
             })
 
+    return summary_rows, written, skipped, tag_updates
+
+
+@flow(name="twistlock-vuln-pull", log_prints=True)
+def twistlock_vuln_pull() -> None:
+    """
+    Daily flow: for each DB target independently, read its components, resolve
+    prod tags, pull Twistlock scan data, and write results back to that same DB.
+    Produces separate Prefect artifacts for dev and prod.
+    """
+    creds = get_credentials()
+    token = authenticate_twistlock(creds)
+    base_url = creds["twistlock_base_url"]
+    twistlock_creds = {
+        "twistlock_base_url": creds["twistlock_base_url"],
+        "twistlock_username": creds["twistlock_username"],
+        "twistlock_password": creds["twistlock_password"],
+    }
+
+    db_labels = ["dev", "prod"]
     run_date = date.today().isoformat()
-    create_table_artifact(
-        key="scan-summary",
-        table=summary_rows,
-        description=f"Vulnerability scan summary for {run_date} (week {_current_iso_week()})",
-    )
-    create_markdown_artifact(
-        key="scan-stats",
-        markdown=f"""## Scan run: {run_date}
+    total_written, total_skipped, total_tag_updates = 0, 0, 0
+
+    for db_target, db_label in zip(creds["db_targets"], db_labels):
+        summary_rows, written, skipped, tag_updates = _scan_db_target(
+            db_target, token, twistlock_creds, base_url, db_label
+        )
+
+        create_table_artifact(
+            key=f"scan-summary-{db_label}",
+            table=summary_rows,
+            description=f"[{db_label.upper()}] Vulnerability scan summary for {run_date} (week {_current_iso_week()})",
+        )
+        create_markdown_artifact(
+            key=f"scan-stats-{db_label}",
+            markdown=f"""## [{db_label.upper()}] Scan run: {run_date}
 
 | Metric | Value |
 |---|---|
@@ -670,16 +692,29 @@ def twistlock_vuln_pull() -> None:
 | Components scanned | {written} |
 | Components skipped | {skipped} |
 | Tags auto-updated | {tag_updates} |
-| Total components | {len(components)} |
+| Total components | {written + skipped} |
 """,
-    )
+        )
+
+        _get_logger().info(
+            "[%s] Complete for week %s — %d written, %d skipped, %d tag(s) updated",
+            db_label,
+            _current_iso_week(),
+            written,
+            skipped,
+            tag_updates,
+        )
+
+        total_written += written
+        total_skipped += skipped
+        total_tag_updates += tag_updates
 
     _get_logger().info(
-        "twistlock_vuln_pull complete for week %s — %d written, %d skipped, %d tag(s) updated",
+        "twistlock_vuln_pull complete for week %s — total: %d written, %d skipped, %d tag(s) updated",
         _current_iso_week(),
-        written,
-        skipped,
-        tag_updates,
+        total_written,
+        total_skipped,
+        total_tag_updates,
     )
 
 
